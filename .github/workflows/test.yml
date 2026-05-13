@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tests/requirements-dev.txt
+
+      - name: Run tests
+        run: python -m pytest tests/ -v
+
+      - name: Self-validate SKILL.md frontmatter via Python yaml
+        run: |
+          python -c "
+          import yaml
+          text = open('SKILL.md').read()
+          fm = yaml.safe_load(text.split('---\n')[1])
+          assert fm['name'] == 'role-x', f'name mismatch: {fm[\"name\"]}'
+          assert 'description' in fm, 'description missing'
+          print('SKILL.md frontmatter OK')
+          "
