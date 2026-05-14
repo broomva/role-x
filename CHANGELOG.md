@@ -5,6 +5,67 @@ All notable changes to `role-x` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-05-13
+
+Hook integration (M2): role-x intake fires automatically on every substantive
+user prompt via a Claude Code `UserPromptSubmit` hook. Closes the
+reasoning-enforcement gap from v0.1.0 — now machine-checkable.
+
+### Added
+- `scripts/role-x-intake-hook.sh` — Claude Code `UserPromptSubmit` hook
+  wrapper. Reads JSON payload from stdin, calls `role-x.py intake`,
+  outputs context to stdout (added to the agent's working context).
+  Graceful-fails (exit 0) if PyYAML missing, `roles/` absent, or workspace
+  not detected. Never blocks a user turn.
+- `role-x intake` subcommand on `scripts/role-x.py`. Reads JSON event from
+  stdin **or** accepts `--prompt`/`--workspace`/`--session` flags for
+  testing. Snapshots git signals (branch, touched files), tokenizes prompt
+  keywords, scores all `roles/*.md` lenses, walks `extends:` chain,
+  decides mode (augment / rewrite / decompose), emits structured event to
+  `~/.config/broomva/role/events.jsonl`, prints intake context to stdout.
+- 7 new tests covering carve-outs (short prompts, missing `roles/`),
+  keyword matching, event persistence, multi-domain decompose escalation,
+  `_meta`-only fallback, stdin JSON protocol.
+
+### Changed
+- Test count: 6 → **13** (all green on Python 3.11 + 3.12 CI).
+- `references/feedback-loop.md` is now wired up: hook + intake subcommand
+  produce events the M4 dream cycle will replay.
+
+### Workspace wiring (separate PR in `broomva/workspace`)
+This release ships the hook *script*. The workspace's `.claude/settings.json`
+must register the hook to fire automatically:
+
+```json
+"UserPromptSubmit": [
+  {
+    "hooks": [
+      {
+        "type": "command",
+        "command": "$HOME/.agents/skills/role-x/scripts/role-x-intake-hook.sh",
+        "timeout": 5
+      }
+    ]
+  }
+]
+```
+
+The hook is reasoning-supplementing, not blocking — `exit 0` always.
+
+### Manual invocation (test or fallback)
+
+```bash
+# Direct CLI test
+python3 ~/.agents/skills/role-x/scripts/role-x.py intake \
+  --prompt "your prompt here" \
+  --workspace "$PWD" \
+  --session "manual"
+
+# Via the hook script (simulating Claude Code stdin)
+echo '{"prompt": "your prompt", "session_id": "manual"}' \
+  | ~/.agents/skills/role-x/scripts/role-x-intake-hook.sh
+```
+
 ## [0.1.0] — 2026-05-13
 
 Initial release. Ships the Markdown lens registry + Python CLI for the bstack
