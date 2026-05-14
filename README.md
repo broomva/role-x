@@ -84,6 +84,69 @@ Selection and mode-decision are **reasoning-enforced** (bstack-idiom, same as P1
 | `role-x list [--roles-dir roles]` | List all lenses with status + extends + default_mode |
 | `role-x validate <path>` | Validate a lens markdown file against the schema (frontmatter shape, required fields, enum values, name-matches-filename) |
 | `role-x index [--roles-dir roles]` | Regenerate `roles/_index.md` discovery file |
+| `role-x intake [--prompt … --workspace … --session …]` | **v0.2.0+** — `UserPromptSubmit` hook entry point. Scores lenses against current signals (git + prompt content), walks `extends:` chain, decides mode, emits event to `~/.config/broomva/role/events.jsonl`, prints agent-context to stdout. Reads JSON from stdin if `--prompt` omitted (the Claude Code hook protocol). |
+
+## Hook integration (v0.2.0+)
+
+The `intake` subcommand can fire automatically on every substantive user prompt via a Claude Code `UserPromptSubmit` hook. Add to your workspace's `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.agents/skills/role-x/scripts/role-x-intake-hook.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The hook:
+
+- Reads the prompt JSON payload from stdin
+- Resolves workspace via `$CLAUDE_PROJECT_DIR` (or `$PWD`)
+- Scores `roles/*.md` against signals (git branch, touched files, prompt keywords)
+- Selects lens(es) with score ≥2, walks `extends:` chain to `_meta`
+- Decides mode (`augment` / `rewrite` / `decompose`)
+- Appends a structured event to `~/.config/broomva/role/events.jsonl`
+- Prints the lens metadata + composed `quality_bar` + suggestions to stdout (added to the agent's working context)
+
+**Always exits 0.** Graceful-fails if PyYAML is missing, the workspace has no `roles/` directory, or the prompt is shorter than 3 words (carve-out for trivial prompts).
+
+### Test the hook locally
+
+```bash
+echo '{"prompt": "implement rust cargo tokio async support", "session_id": "manual"}' \
+  | CLAUDE_PROJECT_DIR=$PWD ~/.agents/skills/role-x/scripts/role-x-intake-hook.sh
+```
+
+Expected output: lens selected, mode decided, quality_bar surfaced, event appended to events.jsonl.
+
+### Event schema
+
+```json
+{
+  "ts": "<ISO-8601 UTC>",
+  "event": "intake",
+  "session": "<session id>",
+  "prompt_digest": "sha256:<hex>",
+  "prompt_word_count": 42,
+  "lenses_selected": ["rust-systems"],
+  "lenses_extended": ["rust-systems", "_meta"],
+  "mode": "augment",
+  "mode_escalation_reason": null,
+  "signals_matched": {"paths": 0, "prompt_keywords": 4, "branch_patterns": 0, "linear_labels": 0}
+}
+```
+
+See [`references/feedback-loop.md`](references/feedback-loop.md) for the full design (M4 dream cycle consumes this telemetry).
 
 ## Lens schema (minimal example)
 
@@ -158,11 +221,11 @@ Full design lives at [`broomva/workspace`](https://github.com/broomva/workspace)
 
 ## Roadmap
 
-- **v0.1.0** (this release) — Markdown lens registry + CLI (`validate`, `list`, `index`) + reference docs
-- **v0.2.0 (M2)** — Hook integration (`UserPromptSubmit` / `PostToolUse` / `Stop`) + `~/.config/broomva/role/events.jsonl` capture + `~/.config/broomva/role/status.json` cache
+- **v0.1.0** — Markdown lens registry + CLI (`validate`, `list`, `index`) + reference docs
+- **v0.2.0** (this release) — `intake` subcommand + `UserPromptSubmit` hook + `~/.config/broomva/role/events.jsonl` capture
 - **v0.3.0 (M3)** — Seed lens corpus expansion (`ts-nextjs`, `api-design`, `security-review`, `infra-deploy`, `docs-research`)
-- **v0.4.0 (M4)** — P13 dream cycle: `role-x-replay.py` with replay-against-frozen-substrate
-- **v0.5.0 (M5)** — `persona-*` skill referenceability + thin lens wrappers
+- **v0.4.0 (M4)** — P13 dream cycle: `role-x-replay.py` with replay-against-frozen-substrate; `status.json` per-lens stats cache
+- **v0.5.0 (M5)** — `persona-*` skill referenceability + thin lens wrappers + `PostToolUse` / `Stop` outcome hooks
 
 ## License
 
