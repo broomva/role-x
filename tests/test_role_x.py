@@ -462,6 +462,227 @@ def test_validate_accepts_v030_optional_fields(tmp_path):
     assert "OK" in out or "valid" in out.lower()
 
 
+# --- v0.4.0: suggest subcommand ---
+
+
+def _write_events(events_path: Path, events: list[dict]) -> None:
+    events_path.parent.mkdir(parents=True, exist_ok=True)
+    with events_path.open("w", encoding="utf-8") as fh:
+        for event in events:
+            fh.write(json.dumps(event) + "\n")
+
+
+def _make_event(
+    ts_iso: str,
+    *,
+    session: str,
+    lenses: list[str],
+    prompt_word_count: int = 10,
+    sanitized_keywords: list[str] | None = None,
+    digest: str = "sha256:placeholder",
+) -> dict:
+    event = {
+        "ts": ts_iso,
+        "event": "intake",
+        "session": session,
+        "prompt_digest": digest,
+        "prompt_word_count": prompt_word_count,
+        "lenses_selected": lenses,
+        "lenses_extended": (lenses or []) + ["_meta"] if lenses else ["_meta"],
+        "mode": "augment",
+        "mode_escalation_reason": None,
+        "signals_matched": {
+            "paths": 0,
+            "prompt_keywords": len(lenses) * 2 if lenses else 0,
+            "branch_patterns": 0,
+            "linear_labels": 0,
+        },
+    }
+    if sanitized_keywords is not None:
+        event["prompt_sanitized"] = {"strategy": "keywords", "value": sanitized_keywords}
+    return event
+
+
+def test_suggest_summarizes_fire_rate(tmp_path):
+    """suggest reports fired vs _meta-only ratio over the window."""
+    events_path = tmp_path / "events.jsonl"
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    _write_events(events_path, [
+        _make_event(now, session="s1", lenses=["rust"], digest="sha256:1"),
+        _make_event(now, session="s2", lenses=[], digest="sha256:2"),
+        _make_event(now, session="s3", lenses=[], digest="sha256:3"),
+    ])
+    rc, out, _ = run_cli("suggest", "--events-path", str(events_path), "--since", "1d")
+    assert rc == 0
+    assert "events: 3" in out
+    assert "fired" in out
+    assert "_meta only" in out
+
+
+def test_suggest_lens_drift_shows_fire_counts(tmp_path):
+    """suggest summarizes per-lens fire count + session count."""
+    events_path = tmp_path / "events.jsonl"
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    _write_events(events_path, [
+        _make_event(now, session="s1", lenses=["rust"], digest="sha256:a"),
+        _make_event(now, session="s2", lenses=["rust"], digest="sha256:b"),
+        _make_event(now, session="s3", lenses=["ts"], digest="sha256:c"),
+    ])
+    rc, out, _ = run_cli("suggest", "--events-path", str(events_path), "--since", "1d")
+    assert rc == 0
+    assert "rust" in out
+    assert "ts" in out
+    assert "2 fires" in out or "2 sessions" in out
+
+
+def test_suggest_clusters_unrouted_when_sanitized_capture_present(tmp_path):
+    """suggest discovers keyword clusters when events carry prompt_sanitized."""
+    events_path = tmp_path / "events.jsonl"
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    # 3 _meta-only events sharing keywords "deploy" + "vercel" + "env" → 1 cluster
+    _write_events(events_path, [
+        _make_event(now, session="s1", lenses=[],
+                    sanitized_keywords=["deploy", "vercel", "env", "preview"],
+                    digest="sha256:c1"),
+        _make_event(now, session="s2", lenses=[],
+                    sanitized_keywords=["deploy", "vercel", "env", "production"],
+                    digest="sha256:c2"),
+        _make_event(now, session="s3", lenses=[],
+                    sanitized_keywords=["deploy", "vercel", "rollback"],
+                    digest="sha256:c3"),
+    ])
+    rc, out, _ = run_cli("suggest", "--events-path", str(events_path), "--since", "1d", "--threshold", "2")
+    assert rc == 0
+    assert "deploy" in out.lower() or "vercel" in out.lower()
+    assert "role-x init" in out  # actionable suggestion
+
+
+def test_suggest_hints_at_config_when_no_sanitized_capture(tmp_path):
+    """Without sanitized capture, suggest tells the user how to enable it."""
+    events_path = tmp_path / "events.jsonl"
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    _write_events(events_path, [
+        _make_event(now, session="s1", lenses=[], digest="sha256:d1"),
+        _make_event(now, session="s2", lenses=[], digest="sha256:d2"),
+    ])
+    rc, out, _ = run_cli("suggest", "--events-path", str(events_path), "--since", "1d")
+    assert rc == 0
+    assert "capture_sanitized_prompt" in out
+    assert "config.json" in out
+
+
+def test_suggest_empty_log_exits_clean(tmp_path):
+    """suggest on a missing/empty events.jsonl exits 0 with a friendly note."""
+    events_path = tmp_path / "no-events.jsonl"
+    rc, out, _ = run_cli("suggest", "--events-path", str(events_path), "--since", "1d")
+    assert rc == 0
+    assert "no events" in out.lower()
+
+
+# --- v0.4.0: init subcommand ---
+
+
+def test_init_creates_candidate_lens(tmp_path):
+    """init scaffolds a valid candidate lens with provided signals."""
+    roles_dir = tmp_path / "roles"
+    rc, out, err = run_cli(
+        "init", "my-lens",
+        "--roles-dir", str(roles_dir),
+        "--keywords", "alpha,beta",
+        "--paths", "**/*.example",
+        "--threshold", "2",
+    )
+    assert rc == 0, err
+    lens_path = roles_dir / "my-lens.md"
+    assert lens_path.exists()
+    content = lens_path.read_text(encoding="utf-8")
+    assert "name: my-lens" in content
+    assert "status: candidate" in content
+    assert "threshold: 2" in content
+    assert "- \"alpha\"" in content
+    assert "- \"**/*.example\"" in content
+    # And the scaffolded lens passes our own validator
+    rc2, vout, _ = run_cli("validate", str(lens_path))
+    assert rc2 == 0, f"scaffold failed validation: {vout}"
+
+
+def test_init_rejects_invalid_name(tmp_path):
+    """init rejects names with uppercase / underscore / non-letter prefix."""
+    roles_dir = tmp_path / "roles"
+    rc, _, err = run_cli("init", "Bad_Name", "--roles-dir", str(roles_dir))
+    assert rc != 0
+    assert "kebab-case" in err.lower() or "lens name" in err.lower()
+
+
+def test_init_refuses_overwrite_without_force(tmp_path):
+    """init refuses to overwrite an existing lens unless --force is given."""
+    roles_dir = tmp_path / "roles"
+    roles_dir.mkdir()
+    existing = roles_dir / "claim.md"
+    existing.write_text("existing content", encoding="utf-8")
+    rc, _, err = run_cli("init", "claim", "--roles-dir", str(roles_dir))
+    assert rc != 0
+    assert "exists" in err.lower()
+    # With --force it succeeds
+    rc2, _, err2 = run_cli("init", "claim", "--roles-dir", str(roles_dir), "--force")
+    assert rc2 == 0, err2
+
+
+# --- v0.4.0: sanitized prompt capture ---
+
+
+def test_intake_records_sanitized_keywords_when_config_opts_in(tmp_path):
+    """When config enables sanitized capture, events.jsonl carries keywords."""
+    workspace = _seed_workspace(tmp_path)
+    # HOME→tmp_path redirects ~/.config/broomva/role/ to tmp_path/.config/...
+    config_dir = tmp_path / ".config" / "broomva" / "role"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "config.json").write_text(
+        json.dumps({"capture_sanitized_prompt": True, "sanitization_strategy": "keywords",
+                    "sanitization_top_n_keywords": 4}),
+        encoding="utf-8",
+    )
+    env = {"HOME": str(tmp_path)}
+    rc, _, _ = run_cli(
+        "intake",
+        "--prompt", "implement rust cargo tokio runtime support thoroughly",
+        "--workspace", str(workspace),
+        "--session", "sanitized-on",
+        env=env,
+    )
+    assert rc == 0
+    events_path = tmp_path / ".config" / "broomva" / "role" / "events.jsonl"
+    assert events_path.exists()
+    event = json.loads(events_path.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert "prompt_sanitized" in event
+    assert event["prompt_sanitized"]["strategy"] == "keywords"
+    # The 4 most distinct keywords (deduped, len>2) from prompt
+    sanitized = event["prompt_sanitized"]["value"]
+    assert isinstance(sanitized, list) and len(sanitized) <= 4
+    assert "rust" in sanitized or "cargo" in sanitized or "tokio" in sanitized
+
+
+def test_intake_does_not_record_sanitized_when_config_absent(tmp_path):
+    """Privacy-by-default: no config → no sanitized capture."""
+    workspace = _seed_workspace(tmp_path)
+    env = {"HOME": str(tmp_path)}  # ~/.config/broomva/role/config.json absent
+    rc, _, _ = run_cli(
+        "intake",
+        "--prompt", "implement rust cargo tokio runtime support",
+        "--workspace", str(workspace),
+        "--session", "sanitized-off",
+        env=env,
+    )
+    assert rc == 0
+    events_path = tmp_path / ".config" / "broomva" / "role" / "events.jsonl"
+    event = json.loads(events_path.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert "prompt_sanitized" not in event
+
+
 # --- intake subcommand (M2) ---
 
 def test_intake_short_prompt_exits_silently(tmp_path):

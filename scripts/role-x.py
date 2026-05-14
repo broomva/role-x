@@ -265,6 +265,19 @@ def cmd_index(args: argparse.Namespace) -> int:
 CARVE_OUT_MIN_WORDS = 3  # prompts shorter than this skip the intake reflex
 EVENTS_PATH = Path.home() / ".config" / "broomva" / "role" / "events.jsonl"
 
+# v0.4.0 — observability config. Privacy-by-default: no sanitized prompt
+# capture unless the operator opts in via this config file. When absent,
+# events.jsonl keeps recording prompt_digest (sha256) only, identical to
+# v0.2.0-v0.3.0 behavior.
+CONFIG_PATH = Path.home() / ".config" / "broomva" / "role" / "config.json"
+CONFIG_DEFAULTS: dict[str, object] = {
+    "capture_sanitized_prompt": False,
+    "sanitization_strategy": "keywords",  # one of: "keywords" | "first_chars"
+    "sanitization_top_n_keywords": 5,
+    "sanitization_first_chars": 80,
+}
+SANITIZATION_STRATEGIES = {"keywords", "first_chars"}
+
 
 def _find_workspace_root(start: Path | None = None) -> Path:
     """Walk up from `start` looking for a workspace marker (roles/, AGENTS.md, .git)."""
@@ -489,8 +502,64 @@ def _select_lenses(
     return selection
 
 
-def _emit_event(session_id: str, prompt: str, selection: dict, events_path: Path = EVENTS_PATH) -> None:
-    """Append an intake event to events.jsonl (best-effort, never raises)."""
+def _load_config(config_path: Path = CONFIG_PATH) -> dict:
+    """Load observability config; return safe defaults on absence or parse error.
+
+    Privacy-by-default: missing config = no sanitized prompt capture.
+    """
+    config = dict(CONFIG_DEFAULTS)
+    try:
+        if config_path.exists():
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                for key in CONFIG_DEFAULTS:
+                    if key in raw:
+                        config[key] = raw[key]
+    except (OSError, json.JSONDecodeError):
+        pass  # any failure → safe defaults
+    # Validate enum value
+    if config["sanitization_strategy"] not in SANITIZATION_STRATEGIES:
+        config["sanitization_strategy"] = CONFIG_DEFAULTS["sanitization_strategy"]
+    return config
+
+
+def _sanitize_prompt(prompt: str, config: dict) -> dict | None:
+    """Produce a sanitized representation per config, or None if disabled.
+
+    Returns dict with {"strategy": str, "value": list[str] | str} or None.
+    """
+    if not config.get("capture_sanitized_prompt"):
+        return None
+    strategy = config.get("sanitization_strategy", "keywords")
+    if strategy == "keywords":
+        top_n = int(config.get("sanitization_top_n_keywords", 5))
+        tokens = _tokenize_prompt(prompt)
+        # Deduplicate while preserving order of first appearance
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for tok in re.findall(r"[A-Za-z][A-Za-z0-9_-]+", prompt):
+            low = tok.lower()
+            if low not in seen and len(low) > 2:  # drop stop-words shorter than 3
+                seen.add(low)
+                ordered.append(low)
+        return {"strategy": "keywords", "value": ordered[:top_n]}
+    if strategy == "first_chars":
+        n = int(config.get("sanitization_first_chars", 80))
+        return {"strategy": "first_chars", "value": prompt[:n]}
+    return None  # unknown strategy → no capture
+
+
+def _emit_event(
+    session_id: str,
+    prompt: str,
+    selection: dict,
+    events_path: Path = EVENTS_PATH,
+    config: dict | None = None,
+) -> None:
+    """Append an intake event to events.jsonl (best-effort, never raises).
+
+    v0.4.0: includes optional `prompt_sanitized` field when config opts in.
+    """
     try:
         events_path.parent.mkdir(parents=True, exist_ok=True)
         event = {
@@ -505,6 +574,10 @@ def _emit_event(session_id: str, prompt: str, selection: dict, events_path: Path
             "mode_escalation_reason": selection["mode_escalation_reason"],
             "signals_matched": selection["signals_matched"],
         }
+        cfg = config if config is not None else _load_config()
+        sanitized = _sanitize_prompt(prompt, cfg)
+        if sanitized is not None:
+            event["prompt_sanitized"] = sanitized
         with events_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(event, ensure_ascii=False) + "\n")
     except OSError:
@@ -620,6 +693,324 @@ def cmd_intake(args: argparse.Namespace) -> int:
     return 0
 
 
+### suggest subcommand (v0.4.0 — observability for organic lens growth) ###
+
+
+def _parse_duration(spec: str) -> int:
+    """Parse a duration spec like '7d', '24h', '90m', '3600s' into seconds."""
+    if not spec:
+        return 7 * 86400
+    unit = spec[-1].lower()
+    try:
+        amount = int(spec[:-1])
+    except ValueError:
+        try:
+            return int(spec)  # bare number = seconds
+        except ValueError:
+            return 7 * 86400
+    multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+    return amount * multipliers.get(unit, 86400)
+
+
+def _read_events_since(events_path: Path, since_seconds: int) -> list[dict]:
+    """Read events.jsonl, returning entries with ts within the window. Best-effort."""
+    if not events_path.exists():
+        return []
+    cutoff = datetime.now(timezone.utc).timestamp() - since_seconds
+    out: list[dict] = []
+    try:
+        for line in events_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ts = event.get("ts", "")
+            try:
+                event_time = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+            except (ValueError, AttributeError):
+                continue
+            if event_time >= cutoff:
+                out.append(event)
+    except OSError:
+        return []
+    return out
+
+
+def _cluster_unrouted(events: list[dict], min_cluster_size: int = 2) -> list[dict]:
+    """Cluster events that routed to _meta-only by shared sanitized keywords.
+
+    Requires `prompt_sanitized.strategy == "keywords"` on events. Returns a list
+    of clusters with keywords/event_count/session_count/suggested_name. Events
+    lacking sanitized capture are skipped silently — caller decides to surface.
+    """
+    keyword_to_events: dict[str, list[dict]] = {}
+    for ev in events:
+        if ev.get("lenses_selected"):
+            continue  # already routed
+        sanitized = ev.get("prompt_sanitized") or {}
+        if sanitized.get("strategy") != "keywords":
+            continue
+        for kw in sanitized.get("value") or []:
+            keyword_to_events.setdefault(kw, []).append(ev)
+
+    # Score keywords by frequency
+    keyword_freq = {kw: len(evs) for kw, evs in keyword_to_events.items()}
+    top_keywords = sorted(keyword_freq.items(), key=lambda x: x[1], reverse=True)
+
+    # Greedy clustering: take top keyword, gather its events, then look at the
+    # most-co-occurring other keyword to form a 2-keyword cluster
+    clusters: list[dict] = []
+    used_events: set[str] = set()  # by prompt_digest
+    for kw, _ in top_keywords[:20]:
+        cluster_events = [
+            ev for ev in keyword_to_events[kw]
+            if ev.get("prompt_digest") not in used_events
+        ]
+        if len(cluster_events) < min_cluster_size:
+            continue
+        # Find co-occurring keywords inside this cluster
+        co_freq: dict[str, int] = {}
+        for ev in cluster_events:
+            for other_kw in (ev.get("prompt_sanitized", {}).get("value") or []):
+                if other_kw != kw:
+                    co_freq[other_kw] = co_freq.get(other_kw, 0) + 1
+        co_top = sorted(co_freq.items(), key=lambda x: x[1], reverse=True)[:2]
+        cluster_keywords = [kw] + [k for k, _ in co_top]
+        sessions = {ev.get("session", "") for ev in cluster_events}
+        for ev in cluster_events:
+            digest = ev.get("prompt_digest")
+            if digest:
+                used_events.add(digest)
+        clusters.append({
+            "keywords": cluster_keywords,
+            "event_count": len(cluster_events),
+            "session_count": len(sessions),
+            "suggested_name": "-".join(cluster_keywords)[:40],
+        })
+    return clusters
+
+
+def _lens_drift_summary(events: list[dict]) -> dict[str, dict]:
+    """For each lens that fired in the window, summarize fire count + sessions.
+
+    Returns dict {lens_name: {fires, sessions, avg_word_count}}.
+    """
+    summary: dict[str, dict] = {}
+    for ev in events:
+        for lens in ev.get("lenses_selected") or []:
+            entry = summary.setdefault(
+                lens, {"fires": 0, "sessions": set(), "word_count_sum": 0}
+            )
+            entry["fires"] += 1
+            entry["sessions"].add(ev.get("session", ""))
+            entry["word_count_sum"] += int(ev.get("prompt_word_count") or 0)
+    out: dict[str, dict] = {}
+    for lens, entry in summary.items():
+        fires = entry["fires"]
+        out[lens] = {
+            "fires": fires,
+            "sessions": len(entry["sessions"]),
+            "avg_word_count": (entry["word_count_sum"] / fires) if fires else 0.0,
+        }
+    return out
+
+
+def cmd_suggest(args: argparse.Namespace) -> int:
+    """Suggest new lenses + per-lens drift signals from events.jsonl telemetry."""
+    events_path = Path(args.events_path) if args.events_path else EVENTS_PATH
+    since_seconds = _parse_duration(args.since)
+    events = _read_events_since(events_path, since_seconds)
+
+    if not events:
+        print(f"[role-x suggest] no events in {events_path} within --since {args.since}")
+        return 0
+
+    total = len(events)
+    fired = sum(1 for ev in events if ev.get("lenses_selected"))
+    unrouted = total - fired
+    pct_fired = (100.0 * fired / total) if total else 0.0
+
+    print(f"[role-x suggest] window: --since {args.since}, events: {total}")
+    print(f"  fired ≥1 lens: {fired} ({pct_fired:.0f}%)")
+    print(f"  _meta only:    {unrouted} ({100 - pct_fired:.0f}%)")
+    print()
+
+    has_sanitized = any(
+        (ev.get("prompt_sanitized") or {}).get("strategy") == "keywords"
+        for ev in events
+    )
+    if not has_sanitized:
+        print("Cluster discovery requires sanitized prompt capture (privacy-by-default off).")
+        print("  → To enable, write:")
+        print(f"    {CONFIG_PATH}")
+        print('    {"capture_sanitized_prompt": true, "sanitization_strategy": "keywords"}')
+        print("  Past events without capture won't be clusterable, but new ones will.")
+        print()
+    else:
+        clusters = _cluster_unrouted(events, min_cluster_size=max(2, args.threshold))
+        if clusters:
+            print(f"Top {len(clusters)} emergent keyword clusters in _meta-only events:")
+            for i, cluster in enumerate(clusters[: args.limit], 1):
+                kws = ", ".join(cluster["keywords"])
+                print(
+                    f"  {i}. [{kws}] — {cluster['event_count']} events, "
+                    f"{cluster['session_count']} sessions"
+                )
+                print(f"     → role-x init {cluster['suggested_name']}")
+            print()
+        else:
+            print("No _meta-only clusters above threshold — registry coverage looks good.")
+            print()
+
+    drift = _lens_drift_summary(events)
+    if drift:
+        print("Active lens drift summary:")
+        for lens, stats in sorted(drift.items(), key=lambda x: x[1]["fires"], reverse=True):
+            print(
+                f"  {lens}: {stats['fires']} fires, {stats['sessions']} sessions, "
+                f"avg prompt {stats['avg_word_count']:.0f} words"
+            )
+        print()
+        print("Future v0.5.0 will add `role-x tune <lens>` for per-lens drift detail.")
+
+    return 0
+
+
+### init subcommand (v0.4.0 — scaffold a new lens from CLI args) ###
+
+
+_INIT_RESERVED_NAMES = {"_index"}
+
+
+def _csv_to_list(spec: str | None) -> list[str]:
+    if not spec:
+        return []
+    return [item.strip() for item in spec.split(",") if item.strip()]
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    """Scaffold a new lens file under roles/.
+
+    Always emits status: candidate (rule-of-three not yet met). The author is
+    expected to commit the file, then promote to status: active after ≥3
+    positive-outcome uses (the bstack engine P16 path).
+    """
+    name = args.name.strip()
+    if not re.fullmatch(r"[a-z][a-z0-9-]*", name):
+        print(
+            f"error: lens name must be kebab-case starting with a letter "
+            f"(got {name!r})",
+            file=sys.stderr,
+        )
+        return 2
+    if name in _INIT_RESERVED_NAMES:
+        print(f"error: {name!r} is a reserved lens name", file=sys.stderr)
+        return 2
+
+    roles_dir = Path(args.roles_dir)
+    if not roles_dir.exists():
+        roles_dir.mkdir(parents=True, exist_ok=True)
+    lens_path = roles_dir / f"{name}.md"
+    if lens_path.exists() and not args.force:
+        print(
+            f"error: {lens_path} already exists. Use --force to overwrite.",
+            file=sys.stderr,
+        )
+        return 1
+
+    keywords = _csv_to_list(args.keywords)
+    paths = _csv_to_list(args.paths)
+    branches = _csv_to_list(args.branch_patterns)
+    labels = _csv_to_list(args.linear_labels)
+    extends = args.extends or "_meta"
+    mode = args.mode
+    if mode not in MODE_VALUES:
+        print(
+            f"error: --mode must be one of {sorted(MODE_VALUES)}, got {mode!r}",
+            file=sys.stderr,
+        )
+        return 2
+
+    today = datetime.now(timezone.utc).date().isoformat()
+
+    def _yaml_list(items: list[str]) -> str:
+        if not items:
+            return " []"
+        return "\n" + "\n".join(f"    - \"{item}\"" for item in items)
+
+    threshold_block = ""
+    if args.threshold is not None:
+        if args.threshold < 1:
+            print("error: --threshold must be >= 1", file=sys.stderr)
+            return 2
+        threshold_block = f"threshold: {args.threshold}\n"
+
+    content = (
+        "---\n"
+        f"name: {name}\n"
+        "status: candidate\n"
+        f"extends: {extends}\n"
+        f"{threshold_block}"
+        "signals:\n"
+        f"  paths:{_yaml_list(paths)}\n"
+        f"  prompt_keywords:{_yaml_list(keywords)}\n"
+        f"  branch_patterns:{_yaml_list(branches)}\n"
+        f"  linear_labels:{_yaml_list(labels)}\n"
+        "context_loaders:\n"
+        "  files: []\n"
+        "  entities: []\n"
+        "  skills: []\n"
+        "  glob_hints: []\n"
+        f"default_mode: {mode}\n"
+        "quality_bar: []\n"
+        "prompt_improvement_patterns: []\n"
+        "mode_escalation:\n"
+        "  rewrite_when: []\n"
+        "  decompose_when: []\n"
+        "out_of_scope: []\n"
+        "related_lenses: []\n"
+        f"created: {today}\n"
+        f"updated: {today}\n"
+        "---\n"
+        "\n"
+        f"# {name} lens\n"
+        "\n"
+        f"> Scaffolded by `role-x init {name}` on {today}. Status: **candidate**.\n"
+        ">\n"
+        "> Promote to `status: active` after at least 3 positive-outcome uses (bstack engine P16).\n"
+        "\n"
+        "## Scope\n"
+        "\n"
+        "TODO: state what this lens covers and what it explicitly doesn't.\n"
+        "\n"
+        "## Quality bar to enforce (P14 dep-chain template)\n"
+        "\n"
+        "TODO: list domain-specific quality_bar entries. The agent will surface these\n"
+        "as the dep-chain template whenever this lens fires.\n"
+        "\n"
+        "## Common anti-patterns this lens should flag\n"
+        "\n"
+        "TODO: list the failure modes this lens exists to prevent.\n"
+        "\n"
+        "## Composition triggers\n"
+        "\n"
+        "TODO: which other lenses commonly compose with this one?\n"
+    )
+
+    lens_path.write_text(content, encoding="utf-8")
+    print(f"wrote {lens_path}")
+    print()
+    print("Next steps:")
+    print(f"  1. Edit {lens_path} — fill in context_loaders + quality_bar + body TODOs")
+    print(f"  2. python3 {sys.argv[0]} validate {lens_path}")
+    print(f"  3. python3 {sys.argv[0]} index --roles-dir {roles_dir}")
+    print(f"  4. git add {lens_path} {roles_dir}/_index.md && git commit")
+    return 0
+
+
 ### Argparse + main ###
 
 
@@ -662,6 +1053,50 @@ def build_parser() -> argparse.ArgumentParser:
         help="session id (default: $CLAUDE_SESSION_ID env or 'unknown')",
     )
     p_intake.set_defaults(func=cmd_intake)
+
+    p_suggest = sub.add_parser(
+        "suggest",
+        help="(v0.4.0) analyze events.jsonl; suggest new lenses + per-lens drift signals",
+    )
+    p_suggest.add_argument(
+        "--since",
+        default="7d",
+        help="window (e.g. 7d, 24h, 90m); default 7d",
+    )
+    p_suggest.add_argument(
+        "--threshold",
+        type=int,
+        default=2,
+        help="minimum event count for a keyword cluster to surface (default 2)",
+    )
+    p_suggest.add_argument(
+        "--limit",
+        type=int,
+        default=10,
+        help="maximum clusters to print (default 10)",
+    )
+    p_suggest.add_argument(
+        "--events-path",
+        default=None,
+        help=f"path to events.jsonl (default: {EVENTS_PATH})",
+    )
+    p_suggest.set_defaults(func=cmd_suggest)
+
+    p_init = sub.add_parser(
+        "init",
+        help="(v0.4.0) scaffold a new candidate lens under roles/",
+    )
+    p_init.add_argument("name", help="kebab-case lens name (becomes roles/<name>.md)")
+    p_init.add_argument("--roles-dir", default="roles", help="path to roles directory (default: roles)")
+    p_init.add_argument("--keywords", default="", help="comma-separated prompt_keywords")
+    p_init.add_argument("--paths", default="", help="comma-separated path globs")
+    p_init.add_argument("--branch-patterns", default="", help="comma-separated branch_patterns")
+    p_init.add_argument("--linear-labels", default="", help="comma-separated linear_labels")
+    p_init.add_argument("--extends", default="_meta", help="parent lens name (default _meta)")
+    p_init.add_argument("--mode", default="augment", help="default_mode (augment | rewrite | decompose)")
+    p_init.add_argument("--threshold", type=int, default=None, help="optional per-lens threshold (≥1)")
+    p_init.add_argument("--force", action="store_true", help="overwrite if file already exists")
+    p_init.set_defaults(func=cmd_init)
 
     return parser
 
