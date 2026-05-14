@@ -28,9 +28,56 @@ Each lens lives at `roles/<name>.md` and consists of YAML frontmatter
 | `created` | ISO date | YYYY-MM-DD |
 | `updated` | ISO date | YYYY-MM-DD |
 
-## Optional fields
+## Optional fields (v0.3.0+)
 
-None at v1. New optional fields require a schema bump + entry in this reference.
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `threshold` | int (≥1) | `2` | Per-lens score threshold. Specialist lenses (e.g. `security-review`) can set 3 to reduce false positives; broad lenses can set 1 to fire on a single strong signal. |
+| `signals.weights.paths` | int (≥0) | `1` | Multiplier on path-glob match count |
+| `signals.weights.prompt_keywords` | int (≥0) | `1` | Multiplier on prompt keyword match count |
+| `signals.weights.branch_patterns` | int (≥0) | `1` | Multiplier on branch pattern match count |
+| `signals.weights.linear_labels` | int (≥0) | `1` | Multiplier on Linear label match count (note: `linear_labels` signal source is currently stubbed to 0 at runtime regardless of weight) |
+
+Setting a weight to `0` disables that signal type for the lens without removing the declaration. All weight values must be **non-negative integers**.
+
+### Example — strict specialist lens with branch-amplified scoring
+
+```yaml
+---
+name: security-review
+status: active
+extends: _meta
+threshold: 3
+signals:
+  paths: ["**/auth/**", "**/credentials*"]
+  prompt_keywords: ["auth", "secret", "credential", "JWT", "OAuth"]
+  branch_patterns: ["feat/auth-*", "feat/security-*"]
+  linear_labels: ["topic:security"]
+  weights:
+    branch_patterns: 3
+    prompt_keywords: 1
+    paths: 1
+context_loaders:
+  files: ["docs/security/checklist.md"]
+  …
+---
+```
+
+Resolution at intake:
+- Prompt = "rotate the JWT signing key" on branch `feat/auth-rotate`
+- Raw counts: prompt_keywords=1 ("JWT"), branch_patterns=1 (matches `feat/auth-*`), paths=0
+- Weighted total: 1×1 + 1×3 + 0×1 = **4**
+- Threshold: 3 → **lens fires** ✓
+
+### When to use which strategy
+
+| Need | Use |
+|---|---|
+| Lens fires too easily on weak signals | Raise `threshold` to 3+ |
+| Lens needs to fire on a single strong domain word | Lower `threshold` to 1 |
+| One signal type matters far more (branch name, ticket label) | Raise that type's weight to 2-3 |
+| Lens has a path that's noisy/incidental | Set `signals.weights.paths: 0` and rely on keywords/branch |
+| Lens covers a very narrow domain (rare false fires acceptable) | `threshold: 1` + 1-2 highly specific keywords |
 
 ## Body content
 
