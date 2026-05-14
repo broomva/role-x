@@ -5,6 +5,132 @@ All notable changes to `role-x` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-05-14
+
+Observability for organic lens growth. Closes the half-loop from v0.3.0 — the
+substrate that lets the `roles/` registry expand from real telemetry instead
+of speculative authoring. Two new subcommands + opt-in sanitized prompt
+capture + a privacy-by-default config layer.
+
+### Added
+
+- **`role-x suggest`** — analyze `events.jsonl` over a window; report fire
+  rate, per-lens drift, and (when sanitized capture is enabled) emergent
+  keyword clusters in `_meta`-only events with suggested lens names.
+  Read-only — never mutates the registry. Hints at the config knob when
+  cluster discovery is disabled.
+
+  ```
+  role-x suggest --since 7d [--threshold N] [--limit M] [--events-path PATH]
+  ```
+
+- **`role-x init <name>`** — scaffold a new `status: candidate` lens under
+  `roles/<name>.md` from CLI flags. Always emits candidates (rule-of-three
+  not yet met); author promotes to `status: active` after ≥3 positive-outcome
+  uses (P16). Scaffolded file passes `validate` immediately.
+
+  ```
+  role-x init <name>
+    [--roles-dir DIR]
+    [--keywords K1,K2,…]
+    [--paths P1,P2,…]
+    [--branch-patterns B1,B2,…]
+    [--linear-labels L1,L2,…]
+    [--threshold N]
+    [--extends NAME]
+    [--mode MODE]
+    [--force]
+  ```
+
+- **Opt-in sanitized prompt capture** — when `~/.config/broomva/role/config.json`
+  contains `{"capture_sanitized_prompt": true}`, the intake hook records a
+  sanitized representation (default: top-N unique keywords) alongside the
+  existing `prompt_digest`. Two strategies supported:
+
+  | Strategy | Captured | Use when |
+  |---|---|---|
+  | `keywords` (default) | top N distinct alphanumeric tokens, lowercased | Lens authoring, cluster discovery — **recommended** |
+  | `first_chars` | first N characters of the raw prompt | Higher-fidelity debugging; more sensitive to PII |
+
+  Config example:
+  ```json
+  {
+    "capture_sanitized_prompt": true,
+    "sanitization_strategy": "keywords",
+    "sanitization_top_n_keywords": 5
+  }
+  ```
+
+  **Privacy invariant**: absent config = no sanitized capture. Existing
+  v0.1.0/v0.2.0/v0.3.0 installations with no config file behave identically
+  to before — only `prompt_digest` (sha256) recorded.
+
+- **Event schema additions** (backward-compatible): events now optionally
+  carry `prompt_sanitized: {strategy, value}`. Events lacking this field
+  continue to validate against the existing schema. M5 dream-cycle consumers
+  must handle both shapes.
+
+- **10 new tests** (20 → **30 total**): suggest fire-rate summary, lens drift,
+  cluster discovery, config-hint path, empty log, init success, invalid name
+  rejection, overwrite refusal, sanitized capture on, sanitized capture off.
+
+### Changed
+
+- `_emit_event` accepts an optional `config` parameter (default: load from
+  CONFIG_PATH). Backward-compatible — existing callers unaffected.
+- `references/feedback-loop.md` marked v0.4.0 substrate as **shipped**; M4
+  dream-cycle phase header retitled to v0.5.0+ (`tune` + `propose-lens`) and
+  v0.6.0+ (`role-x-replay.py`).
+
+### Backward compatibility
+
+- No schema breaking changes. Lenses authored under v0.1.0-v0.3.0 work
+  unchanged.
+- Existing `events.jsonl` files are readable by `role-x suggest` without
+  modification (cluster discovery silently disabled until sanitized capture
+  starts producing events).
+- CLI surface preserved — all v0.1.0-v0.3.0 subcommands keep their signatures.
+- No new required config files. Privacy-by-default; opt-in via config.
+
+### What this enables
+
+```bash
+# After 7+ days of telemetry with sanitized capture on:
+$ role-x suggest --since 7d
+[role-x suggest] window: --since 7d, events: 247
+  fired ≥1 lens: 89 (36%)
+  _meta only:    158 (64%)
+
+Top 3 emergent keyword clusters in _meta-only events:
+  1. [deploy, vercel, env] — 12 events, 6 sessions
+     → role-x init deploy-vercel-env
+  2. [spec, synthesis, research, entity] — 9 events, 7 sessions
+     → role-x init spec-synthesis-research
+  3. [tenant, exclusive-rentals, sentinel] — 5 events, 2 sessions
+     → role-x init tenant-exclusive-rentals
+
+Active lens drift summary:
+  rust-systems: 41 fires, 18 sessions, avg prompt 14 words
+  ts-nextjs:    27 fires, 12 sessions, avg prompt 11 words
+  ...
+```
+
+Data-driven lens authoring — no more speculation about "what lenses might be
+useful".
+
+### Roadmap reshuffle
+
+- **v0.5.0** — `role-x tune <lens>` (propose keyword/threshold/weight diffs
+  from event log) + `role-x propose-lens <cluster>` (generate candidate lens
+  from cluster). PRs only — never silent mutations.
+- **v0.6.0 (M5)** — `role-x-replay.py` (full P13 dream cycle: gather → replay
+  → prune → consolidate → index). Auto-promotion of candidates on positive
+  outcomes.
+- **v0.7.0** — `Stop` + `PostToolUse` outcome hooks → quality signals per
+  lens-use (did the agent reference the loaded context? did the PR merge
+  green? Nous score on resulting entity?).
+- **v0.8.0** — Lens decay + auto-demotion of unused lenses.
+
 ## [0.3.0] — 2026-05-14
 
 Trigger-strategy upgrade: lenses can now declare their own `threshold` and

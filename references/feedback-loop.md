@@ -1,8 +1,12 @@
-# Feedback Loop (M2+ — out of M1 scope)
+# Feedback Loop — design + shipped status
 
 Lens-use telemetry feeds back into lens-rule improvements via the P13
-dream cycle. This file documents the design; implementation lands in
-M2-M4 follow-on plans.
+dream cycle. v0.2.0 shipped the capture layer; v0.4.0 shipped the
+observability + scaffolding layer. v0.5.0+ adds tuning/proposal
+automation; v0.6.0 (M5) ships the full dream cycle.
+
+**See [`observability.md`](observability.md) for the v0.4.0 substrate**
+(event schema, `role-x suggest`, `role-x init`, sanitized capture).
 
 ## Three hook integration points (M2)
 
@@ -38,16 +42,26 @@ distinguishes dream cycles from shadow dreams.
 - OR weekly (whichever fires first)
 - Manual invocation always available
 
-## M2 scope (next plan)
+## Shipped scope
 
-- UserPromptSubmit + PostToolUse + Stop hook scripts
-- `.claude/settings.json` registration
-- events.jsonl + status.json initialization on first use
-- `role-x.py events` subcommand for log inspection
+- **v0.2.0** — `UserPromptSubmit` hook + `role-x intake` subcommand + events.jsonl capture ✓
+- **v0.4.0** — `role-x suggest` + `role-x init` + opt-in sanitized prompt capture + privacy-by-default config ✓
 
-## M4 scope (later plan)
+## Pipeline status
 
-- `role-x-replay.py` 5-phase dream cycle script
-- Frozen-snapshot management under `consolidation-runs/`
-- LLM judge integration for counterfactual scoring
-- Auto-PR for consolidation diffs
+| Stage | Version | Status |
+|---|---|---|
+| Capture intake events | v0.2.0 | ✓ shipped |
+| Sanitized prompt capture (opt-in) | v0.4.0 | ✓ shipped |
+| Analyze + suggest lenses | v0.4.0 | ✓ shipped (`role-x suggest`) |
+| Scaffold candidate lenses | v0.4.0 | ✓ shipped (`role-x init`) |
+| Propose lens-rule tuning | **v0.5.0** | planned (`role-x tune <lens>`) |
+| Generate candidate from cluster | **v0.5.0** | planned (`role-x propose-lens <cluster>`) |
+| PostToolUse outcome capture | **v0.7.0** | planned |
+| Stop outcome capture (CI green, Nous score) | **v0.7.0** | planned |
+| `role-x-replay.py` 5-phase dream cycle | **v0.6.0 (M5)** | planned |
+| Auto-promote candidates on positive outcomes | **v0.6.0 (M5)** | planned |
+| Frozen-snapshot management under `consolidation-runs/` | **v0.6.0 (M5)** | planned |
+| LLM judge integration for counterfactual scoring | **v0.6.0 (M5)** | planned |
+| Auto-PR for consolidation diffs | **v0.6.0 (M5)** | planned |
+| Lens decay + auto-demotion (unused 90d) | **v0.8.0** | planned

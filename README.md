@@ -85,6 +85,8 @@ Selection and mode-decision are **reasoning-enforced** (bstack-idiom, same as P1
 | `role-x validate <path>` | Validate a lens markdown file against the schema (frontmatter shape, required fields, enum values, name-matches-filename) |
 | `role-x index [--roles-dir roles]` | Regenerate `roles/_index.md` discovery file |
 | `role-x intake [--prompt … --workspace … --session …]` | **v0.2.0+** — `UserPromptSubmit` hook entry point. Scores lenses against current signals (git + prompt content), walks `extends:` chain, decides mode, emits event to `~/.config/broomva/role/events.jsonl`, prints agent-context to stdout. Reads JSON from stdin if `--prompt` omitted (the Claude Code hook protocol). |
+| `role-x suggest [--since 7d --threshold N --limit M --events-path PATH]` | **v0.4.0+** — analyze `events.jsonl` over a window. Reports fire-rate (lens-fired vs `_meta`-only), per-lens drift (fires + sessions + avg prompt length), and (when sanitized capture is on) emergent keyword clusters in unrouted events with suggested lens names. Read-only. |
+| `role-x init <name> [--keywords K1,K2 --paths P1,P2 --threshold N --extends NAME ...]` | **v0.4.0+** — scaffold a new `status: candidate` lens under `roles/<name>.md` from CLI flags. Scaffolded file passes `validate` immediately. Author edits, then promotes to `status: active` after ≥3 positive-outcome uses (P16). |
 
 ## Hook integration (v0.2.0+)
 
@@ -219,14 +221,54 @@ python3 -m pytest tests/ -v
 
 Full design lives at [`broomva/workspace`](https://github.com/broomva/workspace) under `docs/superpowers/specs/2026-05-13-role-x-primitive-design.md` (570 lines) and the implementation plan at `docs/superpowers/plans/2026-05-13-role-x-primitive-implementation.md` (2068 lines).
 
+## Observability + lens authoring (v0.4.0+)
+
+The system is designed to grow organically — the `roles/` registry expands from real telemetry, not speculative authoring. The pipeline:
+
+1. **Capture** (v0.2.0+) — `intake` hook logs every prompt routing decision to `~/.config/broomva/role/events.jsonl`
+2. **Sanitize** (v0.4.0, opt-in) — optionally extract top-N keywords or first-N chars from prompts for downstream clustering
+3. **Analyze** (v0.4.0) — `role-x suggest` reports fire-rate, per-lens drift, and emergent keyword clusters
+4. **Scaffold** (v0.4.0) — `role-x init <name>` generates a candidate lens from CLI flags
+5. **Promote** (P16) — after ≥3 positive-outcome uses, author updates `status: candidate → active`
+6. **Tune** (v0.5.0, planned) — `role-x tune <lens>` proposes keyword/threshold/weight diffs as a PR
+7. **Replay** (v0.6.0, planned) — full P13 dream cycle: `role-x-replay.py` consolidates lens rule updates from outcome data
+
+**Privacy by default**: sanitized prompt capture is **off** unless you write
+`~/.config/broomva/role/config.json` with `{"capture_sanitized_prompt": true}`. Without
+that file, only `prompt_digest` (sha256) is recorded — same as v0.1.0-v0.3.0.
+
+Example workflow (after a week of telemetry):
+
+```bash
+# 1. Turn on sanitized capture
+cat > ~/.config/broomva/role/config.json <<EOF
+{"capture_sanitized_prompt": true, "sanitization_strategy": "keywords", "sanitization_top_n_keywords": 5}
+EOF
+
+# 2. Let the hook accumulate events for a few days
+
+# 3. See what lenses to author
+role-x suggest --since 7d
+
+# 4. Scaffold the top suggestion
+role-x init deploy-vercel-env --keywords "deploy,vercel,env,preview" --paths "**/vercel.json"
+
+# 5. Edit the TODO sections, validate, commit
+role-x validate roles/deploy-vercel-env.md
+role-x index --roles-dir roles
+git add roles/ && git commit -m "feat(roles): add deploy-vercel-env candidate lens"
+```
+
 ## Roadmap
 
 - **v0.1.0** — Markdown lens registry + CLI (`validate`, `list`, `index`) + reference docs
 - **v0.2.0** — `intake` subcommand + `UserPromptSubmit` hook + `~/.config/broomva/role/events.jsonl` capture
-- **v0.3.0** (this release) — Per-lens `threshold:` override + per-signal-type `signals.weights:` (see [`references/lens-schema.md`](references/lens-schema.md) §Optional fields)
-- **v0.4.0** — Wire `linear_labels` signal source via Linear MCP probe; seed lens corpus expansion (`ts-nextjs`, `api-design`, `security-review`, `infra-deploy`, `docs-research`)
-- **v0.5.0** — P13 dream cycle: `role-x-replay.py` with replay-against-frozen-substrate; `status.json` per-lens stats cache
-- **v0.6.0** — `persona-*` skill referenceability + thin lens wrappers + `PostToolUse` / `Stop` outcome hooks
+- **v0.3.0** — Per-lens `threshold:` override + per-signal-type `signals.weights:`
+- **v0.4.0** (this release) — Observability for organic growth: `role-x suggest` + `role-x init` + opt-in sanitized prompt capture
+- **v0.5.0** — `role-x tune <lens>` + `role-x propose-lens <cluster>` (PR-driven lens updates)
+- **v0.6.0** — P13 dream cycle: `role-x-replay.py` with replay-against-frozen-substrate; `status.json` per-lens stats cache; auto-promote candidates on rule-of-three positive outcomes
+- **v0.7.0** — `PostToolUse` + `Stop` outcome hooks → quality signals per lens-use
+- **v0.8.0** — Lens decay + auto-demotion of unused lenses
 
 ## License
 
