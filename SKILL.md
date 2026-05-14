@@ -28,7 +28,14 @@ description: |
    - `role-x list` — list all available lenses with status + extends + default_mode
    - `role-x validate <path>` — validate lens YAML frontmatter against schema
    - `role-x index` — regenerate `roles/_index.md` discovery file
-5. **Reference docs** (`references/`):
+   - `role-x intake` (v0.2.0) — `UserPromptSubmit` hook entry point
+   - `role-x suggest` (v0.4.0) — analyze events.jsonl; surface fire-rate + drift + emergent clusters
+   - `role-x init <name>` (v0.4.0) — scaffold a `status: candidate` lens from CLI flags
+   - `role-x coverage` (v0.4.1) — brief registry-health summary; silent when healthy (SessionStart hook entry point)
+5. **Hooks** (`scripts/*-hook.sh`):
+   - `role-x-intake-hook.sh` (v0.2.0) — `UserPromptSubmit` wrapper
+   - `role-x-coverage-hook.sh` (v0.4.1) — `SessionStart` wrapper with 24h cooldown
+6. **Reference docs** (`references/`):
    - `lens-schema.md` — YAML frontmatter field reference
    - `selection-algorithm.md` — scoring algorithm in detail
    - `mode-selection.md` — augment/rewrite/decompose decision tree
@@ -36,9 +43,29 @@ description: |
 
 ## When to invoke
 
-Always — at the start of every session, before responding to substantive user input. P17 is a reflexive primitive. The skill exists to make the lens registry and CLI helpers discoverable; the *behavior* is enforced by reasoning.
+### Intake reflex (every prompt)
+
+Always — at the start of every session, before responding to substantive user input. P17 is a reflexive primitive. The skill exists to make the lens registry and CLI helpers discoverable; the *behavior* is enforced by reasoning + the UserPromptSubmit hook.
 
 Carve-outs (no role-x intake needed): single-line typo fixes, pure read questions ("what does this function do?"), conversation continuation without new substantive request.
+
+### Meta-progression discipline (v0.4.1+)
+
+The intake reflex routes prompts in real-time. The meta-progression discipline ensures the *registry itself* grows from real telemetry:
+
+| When | Action | Cadence |
+|---|---|---|
+| **SessionStart** in a workspace with the role-x coverage hook wired | `role-x coverage --since 7d` fires automatically; surfaces fire-rate + config hints when registry health drops | ≤1 nudge per 24h |
+| **Per substantive prompt** | If intake routes to `_meta` only **AND** prompt is domain-rich (≥8 words, ≥4 distinct meaningful tokens) | Agent sees a 1-line `role-x init <slug>` suggestion appended to the intake context |
+| **When the agent observes a recurring `_meta`-only pattern** within a session (e.g. 3+ unrouted prompts about the same domain) | Propose `role-x init <name>` to the user as the rule-of-three trigger | At the agent's discretion, surfaced as a one-line note |
+| **Weekly (or after collecting ~50+ events)** | Run `role-x suggest --since 7d` for the full report — fire-rate, per-lens drift, emergent keyword clusters (requires sanitized capture on) | Manual, with telemetry signal from the SessionStart nudge |
+| **After ≥3 positive-outcome uses of a `status: candidate` lens** | Author promotes the lens to `status: active` (P16 rule-of-three) | Manual, candidate ledger tracks instances |
+
+### When NOT to invoke meta-actions
+
+- Single-prompt sessions where the intake nudge is purely informational — don't pause work to author lenses mid-flow
+- Edits to existing active lenses unless `role-x tune <lens>` (v0.5.0+) surfaces concrete drift signals
+- New lenses without ≥3 distinct-session evidence in events.jsonl (avoids cargo-cult lens proliferation)
 
 ## When NOT to invoke
 

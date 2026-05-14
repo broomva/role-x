@@ -5,6 +5,97 @@ All notable changes to `role-x` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] — 2026-05-14
+
+Closes the meta-progression gap. The per-prompt routing was wired in v0.2.0;
+v0.4.0 shipped the observability substrate; v0.4.1 wires the agent-facing
+nudges so the *expression* of the system progresses naturally — without
+requiring the user to remember to run `role-x suggest` or notice when the
+registry undercovers their work.
+
+### Added
+
+- **In-prompt authoring nudge** — when intake routes to `_meta` only **AND**
+  the prompt is "domain-rich" (≥8 words, ≥4 distinct meaningful tokens), the
+  agent's working-context output appends one line:
+
+  ```
+  Note: no domain lens scored ≥2 for this prompt. If this kind of work
+  recurs, consider expanding the registry: `role-x init <slug>` (status:
+  candidate).
+  ```
+
+  The slug is auto-derived from the first 2 distinctive tokens. Tuning
+  knobs: `DOMAIN_RICH_MIN_WORDS = 8`, `DOMAIN_RICH_MIN_TOKENS = 4`.
+
+- **`role-x coverage`** — brief registry-health summary suitable for a
+  SessionStart hook. Silent (exit 0, no output) when fire-rate ≥30% AND
+  sanitized capture is enabled. Surfaces a 3-5 line nudge otherwise.
+
+  ```
+  role-x coverage [--since 7d --min-events N --force --events-path PATH]
+  ```
+
+- **`scripts/role-x-coverage-hook.sh`** — Claude Code `SessionStart` hook
+  wrapper. 24h cooldown via `~/.config/broomva/role/coverage-stamp` (override
+  via `ROLE_X_COVERAGE_COOLDOWN_HOURS`). Graceful-fail on missing Python /
+  missing PyYAML / missing CLI. Always exits 0. Wired into workspace via
+  `.claude/settings.json` `SessionStart` entry (separate PR on
+  broomva/workspace).
+
+- **8 new tests** (30 → **38 total**):
+  - `intake_nudges_for_meta_only_domain_rich_prompt`
+  - `intake_no_nudge_when_lens_fires`
+  - `intake_no_nudge_for_short_prompt`
+  - `coverage_silent_when_healthy`
+  - `coverage_reports_when_no_sanitized_capture`
+  - `coverage_reports_low_fire_rate`
+  - `coverage_silent_below_min_events`
+  - `coverage_force_prints_when_below_min`
+
+### Why this exists (the gap closed)
+
+v0.4.0 made `role-x suggest` available, but nothing reminded agents to *run*
+it. The system captured 31 unrouted prompts over 7 days but no one noticed
+the pattern. v0.4.1 fixes that with two complementary nudges:
+
+| Cadence | Mechanism | Trigger |
+|---|---|---|
+| Per-prompt | Intake context appendix | `_meta`-only AND domain-rich prompt |
+| Per-session (≤1/24h) | SessionStart hook → `coverage` | Fire-rate < 30% OR sanitized capture off |
+
+Both are non-blocking and exit silently when the registry is healthy. Like
+P8 skill-freshness, they nudge but never gate.
+
+### Backward compatibility
+
+- All v0.1.0-v0.4.0 lenses work unchanged.
+- Event schema unchanged — nudge is computed at runtime, not stored.
+- CLI signatures preserved.
+- The intake context output has a new optional appendix; agents that don't
+  consume it experience no change.
+
+### Workspace wiring (separate PR on broomva/workspace)
+
+To enable the SessionStart hook, add to `.claude/settings.json`:
+
+```json
+"SessionStart": [
+  {
+    "hooks": [
+      {
+        "type": "command",
+        "command": "$HOME/.agents/skills/role-x/scripts/role-x-coverage-hook.sh",
+        "timeout": 5
+      }
+    ]
+  }
+]
+```
+
+If the role-x install doesn't have v0.4.1+ yet, the hook silently exits 0.
+No new failure mode introduced.
+
 ## [0.4.0] — 2026-05-14
 
 Observability for organic lens growth. Closes the half-loop from v0.3.0 — the
