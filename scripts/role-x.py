@@ -50,12 +50,28 @@ REQUIRED_FIELDS = {
     "updated": (str, object),
 }
 
+# v0.3.0 — optional per-lens overrides. Validated when present, ignored when absent.
+OPTIONAL_FIELDS = {
+    "threshold": int,  # per-lens score threshold; defaults to DEFAULT_THRESHOLD
+}
+
 STATUS_VALUES = {"active", "candidate", "deprecated"}
 MODE_VALUES = {"augment", "rewrite", "decompose"}
 
 REQUIRED_SIGNAL_KEYS = {"paths", "prompt_keywords", "branch_patterns", "linear_labels"}
 REQUIRED_CONTEXT_KEYS = {"files", "entities", "skills", "glob_hints"}
 REQUIRED_ESCALATION_KEYS = {"rewrite_when", "decompose_when"}
+
+# v0.3.0 — workspace-default scoring constants. Per-lens overrides via
+# `threshold:` (top-level) and `signals.weights:` (nested) take precedence.
+DEFAULT_THRESHOLD = 2
+DEFAULT_SIGNAL_WEIGHTS = {
+    "paths": 1,
+    "prompt_keywords": 1,
+    "branch_patterns": 1,
+    "linear_labels": 1,
+}
+SIGNAL_WEIGHT_KEYS = set(DEFAULT_SIGNAL_WEIGHTS.keys())
 
 
 def parse_frontmatter(text: str) -> dict:
@@ -123,6 +139,22 @@ def validate_lens(path: Path) -> tuple[bool, list[str]]:
                 errors.append(f"signals.{key} missing")
             elif not isinstance(signals[key], list):
                 errors.append(f"signals.{key} must be a list")
+        # v0.3.0 optional: signals.weights — per-signal-type weight multipliers
+        weights = signals.get("weights")
+        if weights is not None:
+            if not isinstance(weights, dict):
+                errors.append("signals.weights must be a mapping if present")
+            else:
+                for k, v in weights.items():
+                    if k not in SIGNAL_WEIGHT_KEYS:
+                        errors.append(
+                            f"signals.weights.{k} not recognised; expected one of {sorted(SIGNAL_WEIGHT_KEYS)}"
+                        )
+                        continue
+                    if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+                        errors.append(
+                            f"signals.weights.{k} must be a non-negative integer, got {v!r}"
+                        )
     context = fm.get("context_loaders")
     if isinstance(context, dict):
         for key in REQUIRED_CONTEXT_KEYS:
@@ -137,6 +169,12 @@ def validate_lens(path: Path) -> tuple[bool, list[str]]:
                 errors.append(f"mode_escalation.{key} missing")
             elif not isinstance(escalation[key], list):
                 errors.append(f"mode_escalation.{key} must be a list")
+
+    # v0.3.0 optional top-level fields
+    if "threshold" in fm:
+        t = fm["threshold"]
+        if not isinstance(t, int) or isinstance(t, bool) or t < 1:
+            errors.append(f"threshold must be a positive integer when present, got {t!r}")
 
     return len(errors) == 0, errors
 
@@ -278,8 +316,34 @@ def _tokenize_prompt(prompt: str) -> set[str]:
     return {tok.lower() for tok in re.findall(r"[A-Za-z][A-Za-z0-9_-]+", prompt)}
 
 
+def _resolve_weights(lens: dict) -> dict[str, int]:
+    """v0.3.0 — resolve effective per-signal-type weights for a lens.
+
+    Per-lens `signals.weights.<type>` overrides DEFAULT_SIGNAL_WEIGHTS for that
+    type only; unspecified types stay at default. Returns a fully-populated dict.
+    """
+    declared = ((lens.get("signals") or {}).get("weights") or {})
+    return {
+        key: int(declared.get(key, DEFAULT_SIGNAL_WEIGHTS[key]))
+        for key in SIGNAL_WEIGHT_KEYS
+    }
+
+
+def _resolve_threshold(lens: dict) -> int:
+    """v0.3.0 — resolve the effective selection threshold for a lens."""
+    declared = lens.get("threshold")
+    if isinstance(declared, int) and not isinstance(declared, bool) and declared >= 1:
+        return declared
+    return DEFAULT_THRESHOLD
+
+
 def _score_lens(lens: dict, branch: str, touched_files: list[str], prompt_tokens: set[str]) -> dict:
-    """Score a lens's frontmatter against the current signals. Returns breakdown dict."""
+    """Score a lens's frontmatter against the current signals.
+
+    Returns breakdown dict with raw match counts (for backward-compat event
+    schema) plus weighted total. Per-lens `signals.weights` (v0.3.0) multiplies
+    raw counts when computing the total used for threshold comparison.
+    """
     signals = lens.get("signals", {}) or {}
     paths = signals.get("paths") or []
     prompt_keywords = signals.get("prompt_keywords") or []
@@ -297,12 +361,19 @@ def _score_lens(lens: dict, branch: str, touched_files: list[str], prompt_tokens
         1 for pat in branch_patterns
         if branch and fnmatch.fnmatch(branch, pat)
     )
-    total = path_hits + keyword_hits + branch_hits
+    weights = _resolve_weights(lens)
+    total = (
+        path_hits * weights["paths"]
+        + keyword_hits * weights["prompt_keywords"]
+        + branch_hits * weights["branch_patterns"]
+        # linear_labels still 0 — Linear MCP probe not wired
+    )
     return {
-        "paths": path_hits,
+        "paths": path_hits,  # raw counts (backward-compat for event schema)
         "prompt_keywords": keyword_hits,
         "branch_patterns": branch_hits,
-        "linear_labels": 0,  # not wired yet
+        "linear_labels": 0,
+        "weights_applied": weights,  # v0.3.0 — surfaces resolved weights for debugging
         "total": total,
     }
 
@@ -337,8 +408,18 @@ def _walk_extends(name: str, registry: dict[str, dict]) -> list[str]:
     return chain
 
 
-def _select_lenses(roles_dir: Path, signals: dict, prompt: str, threshold: int = 2) -> dict:
-    """Score all lenses; return selection dict with selected, mode, signals."""
+def _select_lenses(
+    roles_dir: Path,
+    signals: dict,
+    prompt: str,
+    threshold: int = DEFAULT_THRESHOLD,
+) -> dict:
+    """Score all lenses; return selection dict with selected, mode, signals.
+
+    v0.3.0: each lens can override `threshold` (top-level) and
+    `signals.weights.<type>` (nested) — the global `threshold` argument here
+    is only used as the default when a lens doesn't declare its own.
+    """
     lenses: dict[str, dict] = {}
     for path in discover_lenses(roles_dir):
         lens = _load_lens(path)
@@ -352,15 +433,16 @@ def _select_lenses(roles_dir: Path, signals: dict, prompt: str, threshold: int =
     branch = signals.get("branch", "")
     touched = signals.get("touched_files", [])
 
-    scored: list[tuple[str, int, dict]] = []
+    scored: list[tuple[str, int, dict, int]] = []
     for name, lens in lenses.items():
         if name == "_meta":
             continue  # _meta is always applied as the base, not scored
         breakdown = _score_lens(lens, branch, touched, prompt_tokens)
-        scored.append((name, breakdown["total"], breakdown))
+        per_lens_threshold = _resolve_threshold(lens) if "threshold" in lens else threshold
+        scored.append((name, breakdown["total"], breakdown, per_lens_threshold))
     scored.sort(key=lambda x: x[1], reverse=True)
 
-    selected_above_threshold = [(n, t, b) for n, t, b in scored if t >= threshold]
+    selected_above_threshold = [(n, t, b) for n, t, b, th in scored if t >= th]
     selected_names: list[str] = [n for n, _, _ in selected_above_threshold]
 
     if not selected_names and "_meta" in lenses:
@@ -400,7 +482,8 @@ def _select_lenses(roles_dir: Path, signals: dict, prompt: str, threshold: int =
             "branch_patterns": sum(b["branch_patterns"] for _, _, b in selected_above_threshold),
             "linear_labels": 0,
         },
-        "per_lens_scores": {n: b for n, _, b in scored},
+        "per_lens_scores": {n: b for n, _, b, _ in scored},
+        "per_lens_thresholds": {n: th for n, _, _, th in scored},
         "registry": lenses,
     }
     return selection

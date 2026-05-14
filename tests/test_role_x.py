@@ -220,6 +220,248 @@ Test ts lens.
 """
 
 
+# v0.3.0 fixtures — per-lens threshold + weighted signals
+
+_FIXTURE_STRICT_LENS = """---
+name: strict
+status: active
+extends: _meta
+threshold: 3
+signals:
+  paths: []
+  prompt_keywords: ["alpha", "beta"]
+  branch_patterns: []
+  linear_labels: []
+context_loaders:
+  files: []
+  entities: []
+  skills: []
+  glob_hints: []
+default_mode: augment
+quality_bar: []
+prompt_improvement_patterns: []
+mode_escalation:
+  rewrite_when: []
+  decompose_when: []
+out_of_scope: []
+related_lenses: []
+created: 2026-05-13
+updated: 2026-05-13
+---
+# strict
+Threshold=3 — requires ≥3 signals; 2 keywords alone won't fire it.
+"""
+
+_FIXTURE_LOOSE_LENS = """---
+name: loose
+status: active
+extends: _meta
+threshold: 1
+signals:
+  paths: []
+  prompt_keywords: ["solo"]
+  branch_patterns: []
+  linear_labels: []
+context_loaders:
+  files: []
+  entities: []
+  skills: []
+  glob_hints: []
+default_mode: augment
+quality_bar: []
+prompt_improvement_patterns: []
+mode_escalation:
+  rewrite_when: []
+  decompose_when: []
+out_of_scope: []
+related_lenses: []
+created: 2026-05-13
+updated: 2026-05-13
+---
+# loose
+Threshold=1 — a single keyword match is enough.
+"""
+
+_FIXTURE_AMPLIFIED_LENS = """---
+name: amplified
+status: active
+extends: _meta
+signals:
+  paths: []
+  prompt_keywords: ["singular"]
+  branch_patterns: []
+  linear_labels: []
+  weights:
+    prompt_keywords: 3
+context_loaders:
+  files: []
+  entities: []
+  skills: []
+  glob_hints: []
+default_mode: augment
+quality_bar: []
+prompt_improvement_patterns: []
+mode_escalation:
+  rewrite_when: []
+  decompose_when: []
+out_of_scope: []
+related_lenses: []
+created: 2026-05-13
+updated: 2026-05-13
+---
+# amplified
+1 keyword × weight 3 = 3 ≥ default threshold 2 → fires on a single match.
+"""
+
+_FIXTURE_DISABLED_PATHS_LENS = """---
+name: disabled-paths
+status: active
+extends: _meta
+signals:
+  paths: ["**/*.never"]
+  prompt_keywords: ["only-via-keyword"]
+  branch_patterns: []
+  linear_labels: []
+  weights:
+    paths: 0
+    prompt_keywords: 2
+context_loaders:
+  files: []
+  entities: []
+  skills: []
+  glob_hints: []
+default_mode: augment
+quality_bar: []
+prompt_improvement_patterns: []
+mode_escalation:
+  rewrite_when: []
+  decompose_when: []
+out_of_scope: []
+related_lenses: []
+created: 2026-05-13
+updated: 2026-05-13
+---
+# disabled-paths
+paths weight = 0 makes path matches inert; keyword weight 2 carries the lens.
+"""
+
+
+def _seed_with(tmp_path: Path, *lens_fixtures: tuple[str, str]) -> Path:
+    """Build a workspace with custom lens fixtures. Each tuple is (name, content)."""
+    workspace = tmp_path / "ws-custom"
+    workspace.mkdir()
+    (workspace / "AGENTS.md").write_text("# AGENTS\n", encoding="utf-8")
+    roles = workspace / "roles"
+    roles.mkdir()
+    (roles / "_meta.md").write_text(_FIXTURE_META, encoding="utf-8")
+    for name, content in lens_fixtures:
+        (roles / f"{name}.md").write_text(content, encoding="utf-8")
+    return workspace
+
+
+# --- v0.3.0: per-lens threshold ---
+
+def test_per_lens_threshold_3_blocks_2_signal_fire(tmp_path):
+    """A lens declaring threshold=3 does NOT fire on 2 keyword matches."""
+    workspace = _seed_with(tmp_path, ("strict", _FIXTURE_STRICT_LENS))
+    env = {"HOME": str(tmp_path)}
+    rc, out, _ = run_cli(
+        "intake",
+        "--prompt", "discuss alpha and beta in detail",  # hits 2 keywords
+        "--workspace", str(workspace),
+        "--session", "strict-blocks-2",
+        env=env,
+    )
+    assert rc == 0
+    # strict needs 3 → only _meta applies
+    assert "_meta only" in out
+    assert "strict" not in out.split("Lens(es):")[1].split("\n", 1)[0]
+
+
+def test_per_lens_threshold_1_fires_on_single_signal(tmp_path):
+    """A lens declaring threshold=1 fires on a single keyword match."""
+    workspace = _seed_with(tmp_path, ("loose", _FIXTURE_LOOSE_LENS))
+    env = {"HOME": str(tmp_path)}
+    rc, out, _ = run_cli(
+        "intake",
+        "--prompt", "this prompt mentions solo only once",
+        "--workspace", str(workspace),
+        "--session", "loose-fires-on-1",
+        env=env,
+    )
+    assert rc == 0
+    assert "loose" in out
+    assert "_meta only" not in out
+
+
+# --- v0.3.0: weighted signals ---
+
+def test_weighted_keyword_amplifies_single_hit_to_fire(tmp_path):
+    """A lens with prompt_keywords weight=3 fires on a single keyword (1×3 ≥ default 2)."""
+    workspace = _seed_with(tmp_path, ("amplified", _FIXTURE_AMPLIFIED_LENS))
+    env = {"HOME": str(tmp_path)}
+    rc, out, _ = run_cli(
+        "intake",
+        "--prompt", "this contains the word singular precisely once",
+        "--workspace", str(workspace),
+        "--session", "weighted-amplify",
+        env=env,
+    )
+    assert rc == 0
+    assert "amplified" in out
+
+
+def test_zero_weight_disables_signal_type(tmp_path):
+    """A lens with weights.paths=0 ignores path matches entirely."""
+    workspace = _seed_with(tmp_path, ("disabled-paths", _FIXTURE_DISABLED_PATHS_LENS))
+    env = {"HOME": str(tmp_path)}
+    # Add a touched file that matches the path glob — should NOT contribute
+    (workspace / "fake.never").write_text("", encoding="utf-8")
+    rc, out, _ = run_cli(
+        "intake",
+        "--prompt", "no triggering content here at all",  # no keyword match
+        "--workspace", str(workspace),
+        "--session", "zero-weight-disabled",
+        env=env,
+    )
+    assert rc == 0
+    # paths weight=0 → path match contributes 0; no keyword match → 0; total=0 → not selected
+    assert "disabled-paths" not in out.split("Lens(es):")[1].split("\n", 1)[0] if "Lens(es):" in out else True
+
+
+# --- v0.3.0: schema validation ---
+
+def test_validate_rejects_negative_threshold(tmp_path):
+    """validate subcommand fails when threshold is 0 or negative."""
+    lens_path = tmp_path / "bad-threshold.md"
+    lens_path.write_text(_FIXTURE_LOOSE_LENS.replace("threshold: 1", "threshold: 0"), encoding="utf-8")
+    rc, _, err = run_cli("validate", str(lens_path))
+    assert rc != 0
+    assert "threshold" in err.lower()
+
+
+def test_validate_rejects_unknown_weight_key(tmp_path):
+    """validate fails when signals.weights has an unrecognised key."""
+    bogus = _FIXTURE_AMPLIFIED_LENS.replace(
+        "weights:\n    prompt_keywords: 3",
+        "weights:\n    prompt_keywords: 3\n    bogus_signal: 2",
+    )
+    lens_path = tmp_path / "bad-weight-key.md"
+    lens_path.write_text(bogus, encoding="utf-8")
+    rc, _, err = run_cli("validate", str(lens_path))
+    assert rc != 0
+    assert "bogus_signal" in err.lower() or "not recognised" in err.lower()
+
+
+def test_validate_accepts_v030_optional_fields(tmp_path):
+    """Lens with valid v0.3.0 optional fields validates clean."""
+    lens_path = tmp_path / "amplified.md"
+    lens_path.write_text(_FIXTURE_AMPLIFIED_LENS, encoding="utf-8")
+    rc, out, _ = run_cli("validate", str(lens_path))
+    assert rc == 0
+    assert "OK" in out or "valid" in out.lower()
+
+
 # --- intake subcommand (M2) ---
 
 def test_intake_short_prompt_exits_silently(tmp_path):

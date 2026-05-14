@@ -17,21 +17,45 @@ When the first-touch agent receives a substantive user input, it executes:
 
 ## Step 3: Score each lens
 
-For each lens L:
+For each lens L (v0.3.0+):
 
 ```
-score(L) =
-  sum(1 for glob in L.signals.paths if any(fnmatch(f, glob) for f in touched_files))
-+ sum(1 for kw in L.signals.prompt_keywords if kw.lower() in prompt_tokens)
-+ sum(1 for pat in L.signals.branch_patterns if fnmatch(current_branch, pat))
-+ sum(1 for lbl in L.signals.linear_labels if lbl in linear_labels)
+raw_counts = {
+  paths:           count(glob in L.signals.paths        : any fnmatch(f, glob) for f in touched_files),
+  prompt_keywords: count(kw   in L.signals.prompt_keywords : kw.lower() in prompt_tokens),
+  branch_patterns: count(pat  in L.signals.branch_patterns : fnmatch(current_branch, pat)),
+  linear_labels:   count(lbl  in L.signals.linear_labels   : lbl in linear_labels),
+}
+
+# v0.3.0 — per-signal-type weights. Each lens may declare
+# signals.weights.<type>: <int>. Missing entries default to 1.
+weights = L.signals.weights ∪ {paths: 1, prompt_keywords: 1, branch_patterns: 1, linear_labels: 1}
+
+score(L) = Σ raw_counts[type] × weights[type]   for each signal type
 ```
+
+Raw counts are preserved separately for backward-compat with v0.2.0 event-log
+schema (`events.jsonl` records counts, not weighted scores). The weighted total
+is only used for selection.
 
 ## Step 4: Select lens(es)
 
-- Threshold: `score(L) >= 2` (at least two independent signals match)
+- **Threshold (v0.3.0)**: per-lens via `L.threshold` (top-level frontmatter
+  field); falls back to `DEFAULT_THRESHOLD = 2` if not declared.
+- Selection: `selected = [L for L in lenses if score(L) >= L.effective_threshold]`
 - Composition: if multiple lenses pass, apply all in descending score order
 - Fallback: if no lens passes, apply `_meta` only
+
+### v0.3.0 design notes
+
+- `signals.weights.<type>: 0` is the supported way to disable a signal type for
+  a specific lens without removing its declaration.
+- A lens's `threshold` cannot be less than 1 (validated at schema check).
+- The `_meta` lens is excluded from scoring — it's always applied as the base
+  via the `extends:` resolution.
+- The `linear_labels` signal source is still stubbed (always returns 0 raw
+  count) — declaring a weight on it has no runtime effect until Linear MCP is
+  wired (v0.4.0+ planned).
 
 ## Step 5: Resolve extension chain
 

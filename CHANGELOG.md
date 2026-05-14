@@ -5,6 +5,94 @@ All notable changes to `role-x` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-05-14
+
+Trigger-strategy upgrade: lenses can now declare their own `threshold` and
+per-signal-type `weights`. Closes the "every lens shares the same global
+scoring rules" limitation in v0.1.0/v0.2.0.
+
+### Added
+
+- **Per-lens threshold override** — optional top-level `threshold: int` in lens
+  frontmatter. Defaults to workspace global (`DEFAULT_THRESHOLD = 2`). Specialist
+  lenses can set `threshold: 3` to avoid false positives; broad lenses can set
+  `threshold: 1` to fire on a single strong signal.
+- **Per-signal-type weights** — optional nested `signals.weights:` block. Each
+  signal type (`paths`, `prompt_keywords`, `branch_patterns`, `linear_labels`)
+  can declare its own multiplier (default 1 each). Use cases:
+  - Weight branch patterns higher (e.g. `branch_patterns: 3`) when branch name
+    is a strong intent signal
+  - Set a signal type to `0` to disable it for a specific lens without removing
+    the declaration
+  - Amplify keyword matches (e.g. `prompt_keywords: 2`) for lenses where a
+    single keyword hit should suffice
+- **Validation extensions** — `role-x validate` now rejects:
+  - `threshold` that is non-integer, boolean, or `<1`
+  - `signals.weights` entries with non-int or negative values
+  - `signals.weights` keys not in the recognised signal-type set
+- **7 new tests** — boundary cases for per-lens threshold (1 and 3), weighted
+  amplification, zero-weight signal disabling, and schema validation. Total: 20/20.
+- **Output**: `_score_lens` breakdown now includes `weights_applied` so a future
+  `role-x explain` subcommand can surface why a lens fired (or didn't).
+- **Event log**: `per_lens_thresholds` map added to internal selection dict for
+  future telemetry consumers. Wire-format `events.jsonl` schema is unchanged
+  (raw counts in `signals_matched`, not weighted) — backward-compat preserved
+  for M4 dream-cycle consumers.
+
+### Changed
+
+- `_score_lens` total is now `sum(raw_count × weight)` per signal type instead
+  of `sum(raw_count)`. Lenses without `signals.weights` are unaffected (all
+  weights default to 1, identical to v0.2.0 behavior).
+- `_select_lenses` uses `_resolve_threshold(lens)` per-lens instead of a single
+  global threshold. The `threshold=` argument remains the fallback default.
+- Test count: 13 → 20 (Python 3.11 + 3.12 matrix).
+
+### Backward compatibility
+
+- All v0.1.0/v0.2.0 lenses (no `threshold`, no `signals.weights`) keep their
+  exact prior behavior. Verified: workspace's `roles/_meta.md` + `roles/rust-systems.md`
+  unchanged in scoring outcome.
+- `events.jsonl` schema unchanged — recorded counts remain raw (unweighted).
+- CLI surface unchanged — `validate` / `list` / `index` / `intake` subcommands
+  all preserve their v0.2.0 signatures.
+
+### Migration
+
+No migration needed. Existing lenses keep working. To opt into the new
+strategies, add `threshold:` or `signals.weights:` to a lens's frontmatter
+and re-run `role-x validate <lens>` to confirm.
+
+### Example: a security-review lens with strict threshold
+
+```yaml
+---
+name: security-review
+status: active
+extends: _meta
+threshold: 3                  # require ≥3 signals — avoid false positives
+signals:
+  paths:
+    - "**/auth/**"
+    - "**/credentials*"
+  prompt_keywords:
+    - "auth", "secret", "credential", "JWT", "OAuth"
+  branch_patterns:
+    - "feat/auth-*"
+    - "feat/security-*"
+  linear_labels:
+    - "topic:security"
+  weights:
+    branch_patterns: 3          # branch is a strong signal — 1 hit = 3 score
+    prompt_keywords: 1
+    paths: 1
+…
+---
+```
+
+A prompt mentioning "auth" on `feat/auth-something` branch → 1 keyword (×1) + 1 branch
+(×3) = 4 ≥ threshold 3 → fires.
+
 ## [0.2.0] — 2026-05-13
 
 Hook integration (M2): role-x intake fires automatically on every substantive

@@ -222,10 +222,11 @@ Full design lives at [`broomva/workspace`](https://github.com/broomva/workspace)
 ## Roadmap
 
 - **v0.1.0** — Markdown lens registry + CLI (`validate`, `list`, `index`) + reference docs
-- **v0.2.0** (this release) — `intake` subcommand + `UserPromptSubmit` hook + `~/.config/broomva/role/events.jsonl` capture
-- **v0.3.0 (M3)** — Seed lens corpus expansion (`ts-nextjs`, `api-design`, `security-review`, `infra-deploy`, `docs-research`)
-- **v0.4.0 (M4)** — P13 dream cycle: `role-x-replay.py` with replay-against-frozen-substrate; `status.json` per-lens stats cache
-- **v0.5.0 (M5)** — `persona-*` skill referenceability + thin lens wrappers + `PostToolUse` / `Stop` outcome hooks
+- **v0.2.0** — `intake` subcommand + `UserPromptSubmit` hook + `~/.config/broomva/role/events.jsonl` capture
+- **v0.3.0** (this release) — Per-lens `threshold:` override + per-signal-type `signals.weights:` (see [`references/lens-schema.md`](references/lens-schema.md) §Optional fields)
+- **v0.4.0** — Wire `linear_labels` signal source via Linear MCP probe; seed lens corpus expansion (`ts-nextjs`, `api-design`, `security-review`, `infra-deploy`, `docs-research`)
+- **v0.5.0** — P13 dream cycle: `role-x-replay.py` with replay-against-frozen-substrate; `status.json` per-lens stats cache
+- **v0.6.0** — `persona-*` skill referenceability + thin lens wrappers + `PostToolUse` / `Stop` outcome hooks
 
 ## License
 
