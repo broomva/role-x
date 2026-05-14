@@ -87,6 +87,7 @@ Selection and mode-decision are **reasoning-enforced** (bstack-idiom, same as P1
 | `role-x intake [--prompt … --workspace … --session …]` | **v0.2.0+** — `UserPromptSubmit` hook entry point. Scores lenses against current signals (git + prompt content), walks `extends:` chain, decides mode, emits event to `~/.config/broomva/role/events.jsonl`, prints agent-context to stdout. Reads JSON from stdin if `--prompt` omitted (the Claude Code hook protocol). |
 | `role-x suggest [--since 7d --threshold N --limit M --events-path PATH]` | **v0.4.0+** — analyze `events.jsonl` over a window. Reports fire-rate (lens-fired vs `_meta`-only), per-lens drift (fires + sessions + avg prompt length), and (when sanitized capture is on) emergent keyword clusters in unrouted events with suggested lens names. Read-only. |
 | `role-x init <name> [--keywords K1,K2 --paths P1,P2 --threshold N --extends NAME ...]` | **v0.4.0+** — scaffold a new `status: candidate` lens under `roles/<name>.md` from CLI flags. Scaffolded file passes `validate` immediately. Author edits, then promotes to `status: active` after ≥3 positive-outcome uses (P16). |
+| `role-x coverage [--since 7d --min-events 10 --force]` | **v0.4.1+** — brief registry-health summary. Silent (exit 0, no output) when fire-rate ≥30% AND sanitized capture is on. Surfaces a 3-5 line nudge otherwise. Designed as the entry point for the `SessionStart` hook with a 24h cooldown — `scripts/role-x-coverage-hook.sh` wires this. |
 
 ## Hook integration (v0.2.0+)
 
@@ -264,7 +265,8 @@ git add roles/ && git commit -m "feat(roles): add deploy-vercel-env candidate le
 - **v0.1.0** — Markdown lens registry + CLI (`validate`, `list`, `index`) + reference docs
 - **v0.2.0** — `intake` subcommand + `UserPromptSubmit` hook + `~/.config/broomva/role/events.jsonl` capture
 - **v0.3.0** — Per-lens `threshold:` override + per-signal-type `signals.weights:`
-- **v0.4.0** (this release) — Observability for organic growth: `role-x suggest` + `role-x init` + opt-in sanitized prompt capture
+- **v0.4.0** — Observability for organic growth: `role-x suggest` + `role-x init` + opt-in sanitized prompt capture
+- **v0.4.1** (this release) — Meta-progression nudges: `role-x coverage` SessionStart hook + per-prompt authoring suggestion when intake routes to `_meta` only on a domain-rich prompt
 - **v0.5.0** — `role-x tune <lens>` + `role-x propose-lens <cluster>` (PR-driven lens updates)
 - **v0.6.0** — P13 dream cycle: `role-x-replay.py` with replay-against-frozen-substrate; `status.json` per-lens stats cache; auto-promote candidates on rule-of-three positive outcomes
 - **v0.7.0** — `PostToolUse` + `Stop` outcome hooks → quality signals per lens-use

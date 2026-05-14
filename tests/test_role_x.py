@@ -683,6 +683,143 @@ def test_intake_does_not_record_sanitized_when_config_absent(tmp_path):
     assert "prompt_sanitized" not in event
 
 
+# --- v0.4.1: intake authoring nudge (meta-progression) ---
+
+
+def test_intake_nudges_for_meta_only_domain_rich_prompt(tmp_path):
+    """When no domain lens fires AND prompt is substantive, surface a role-x init suggestion."""
+    workspace = _seed_workspace(tmp_path)
+    env = {"HOME": str(tmp_path)}
+    rc, out, _ = run_cli(
+        "intake",
+        # Substantive but no lens-matching keywords — should route to _meta
+        "--prompt", "draft a thorough strategic brief about quarterly rollout plans for partner onboarding initiatives",
+        "--workspace", str(workspace),
+        "--session", "nudge-test",
+        env=env,
+    )
+    assert rc == 0
+    assert "_meta only" in out  # routed to _meta
+    assert "role-x init" in out  # nudge present
+    assert "no domain lens scored" in out
+
+
+def test_intake_no_nudge_when_lens_fires(tmp_path):
+    """When a domain lens DOES fire, no authoring nudge — registry covered."""
+    workspace = _seed_workspace(tmp_path)
+    env = {"HOME": str(tmp_path)}
+    rc, out, _ = run_cli(
+        "intake",
+        "--prompt", "implement rust cargo tokio async runtime with proper error handling",
+        "--workspace", str(workspace),
+        "--session", "no-nudge-when-fired",
+        env=env,
+    )
+    assert rc == 0
+    assert "rust" in out  # lens fired
+    assert "role-x init" not in out  # no nudge
+
+
+def test_intake_no_nudge_for_short_prompt(tmp_path):
+    """Short prompts don't trigger the authoring nudge even when _meta-only."""
+    workspace = _seed_workspace(tmp_path)
+    env = {"HOME": str(tmp_path)}
+    rc, out, _ = run_cli(
+        "intake",
+        "--prompt", "what does this do briefly",  # 5 words — below DOMAIN_RICH_MIN_WORDS
+        "--workspace", str(workspace),
+        "--session", "no-nudge-short",
+        env=env,
+    )
+    assert rc == 0
+    assert "role-x init" not in out
+
+
+# --- v0.4.1: coverage subcommand ---
+
+
+def test_coverage_silent_when_healthy(tmp_path):
+    """Coverage subcommand stays silent when fire-rate >= floor and sanitized capture is on."""
+    events_path = tmp_path / "events.jsonl"
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    # 10 events, 5 lens-fired (50%) + sanitized capture present → healthy
+    events = []
+    for i in range(5):
+        events.append(_make_event(
+            now, session=f"s{i}", lenses=["rust"],
+            sanitized_keywords=["rust", "cargo"],
+            digest=f"sha256:f{i}",
+        ))
+    for i in range(5):
+        events.append(_make_event(
+            now, session=f"u{i}", lenses=[],
+            sanitized_keywords=["something", "else"],
+            digest=f"sha256:u{i}",
+        ))
+    _write_events(events_path, events)
+    rc, out, _ = run_cli("coverage", "--since", "1d", "--events-path", str(events_path))
+    assert rc == 0
+    assert out.strip() == ""  # silent
+
+
+def test_coverage_reports_when_no_sanitized_capture(tmp_path):
+    """Coverage prints config hint when sanitized capture is off — even with healthy fire-rate."""
+    events_path = tmp_path / "events.jsonl"
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    events = [_make_event(now, session=f"s{i}", lenses=["rust"], digest=f"sha256:n{i}") for i in range(15)]
+    _write_events(events_path, events)
+    rc, out, _ = run_cli("coverage", "--since", "1d", "--events-path", str(events_path))
+    assert rc == 0
+    assert "capture_sanitized_prompt" in out  # config hint surfaced
+    assert "role-x init" in out
+
+
+def test_coverage_reports_low_fire_rate(tmp_path):
+    """Coverage prints nudge when fire-rate is below the floor."""
+    events_path = tmp_path / "events.jsonl"
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    # 15 events, 1 fired (7%) + sanitized → low coverage
+    events = [_make_event(now, session=f"u{i}", lenses=[],
+                          sanitized_keywords=["foo", "bar"], digest=f"sha256:l{i}")
+              for i in range(14)]
+    events.append(_make_event(now, session="hit", lenses=["rust"],
+                              sanitized_keywords=["rust"], digest="sha256:hit"))
+    _write_events(events_path, events)
+    rc, out, _ = run_cli("coverage", "--since", "1d", "--events-path", str(events_path))
+    assert rc == 0
+    assert "low" in out.lower()
+    assert "suggest" in out.lower() or "role-x init" in out
+
+
+def test_coverage_silent_below_min_events(tmp_path):
+    """Coverage stays silent when there's not enough data to draw a conclusion."""
+    events_path = tmp_path / "events.jsonl"
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    events = [_make_event(now, session="s1", lenses=[], digest="sha256:f1")]
+    _write_events(events_path, events)
+    rc, out, _ = run_cli("coverage", "--since", "1d", "--events-path", str(events_path))
+    assert rc == 0
+    assert out.strip() == ""  # below default min-events floor
+
+
+def test_coverage_force_prints_when_below_min(tmp_path):
+    """--force overrides the min-events silent threshold."""
+    events_path = tmp_path / "events.jsonl"
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    events = [_make_event(now, session="s1", lenses=[], digest="sha256:f1")]
+    _write_events(events_path, events)
+    rc, out, _ = run_cli(
+        "coverage", "--since", "1d", "--events-path", str(events_path), "--force",
+    )
+    assert rc == 0
+    assert out.strip() != ""
+
+
 # --- intake subcommand (M2) ---
 
 def test_intake_short_prompt_exits_silently(tmp_path):

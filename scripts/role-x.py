@@ -263,6 +263,18 @@ def cmd_index(args: argparse.Namespace) -> int:
 
 
 CARVE_OUT_MIN_WORDS = 3  # prompts shorter than this skip the intake reflex
+
+# v0.4.1 — "domain-rich" heuristic. When intake routes to _meta-only AND the
+# prompt is non-trivial AND has enough distinct meaningful tokens, surface a
+# one-line nudge: "consider role-x init <slug>". Closes the gap where agents
+# saw _meta-only repeatedly but never aggregated the signal.
+DOMAIN_RICH_MIN_WORDS = 8
+DOMAIN_RICH_MIN_TOKENS = 4
+
+# v0.4.1 — coverage thresholds for the SessionStart hook's silent-when-healthy
+# logic. If recent fire-rate is at-or-above this floor AND there's no
+# clusters-above-threshold visible, the coverage hook stays silent.
+COVERAGE_HEALTHY_FIRE_RATE = 30  # percent
 EVENTS_PATH = Path.home() / ".config" / "broomva" / "role" / "events.jsonl"
 
 # v0.4.0 — observability config. Privacy-by-default: no sanitized prompt
@@ -651,7 +663,54 @@ def _format_intake_context(selection: dict) -> str:
         "Agents: apply the quality_bar entries as the P14 enumeration template for this response. "
         "If mode != augment, surface the rewrite/decompose proposal to the user before proceeding."
     )
+    # v0.4.1: when no domain lens fired AND the prompt is domain-rich enough
+    # to plausibly merit one, surface a one-line "consider authoring a lens"
+    # nudge. Pure suggestion — agent decides whether to act on it.
+    nudge = selection.get("authoring_nudge")
+    if nudge:
+        lines.append("")
+        lines.append(nudge)
     return "\n".join(lines)
+
+
+def _domain_rich(prompt: str, word_count: int) -> bool:
+    """Heuristic: is the prompt substantive enough to plausibly need a lens?"""
+    if word_count < DOMAIN_RICH_MIN_WORDS:
+        return False
+    tokens = {
+        tok.lower()
+        for tok in re.findall(r"[A-Za-z][A-Za-z0-9_-]+", prompt)
+        if len(tok) > 3  # filter trivial connectors
+    }
+    return len(tokens) >= DOMAIN_RICH_MIN_TOKENS
+
+
+def _build_authoring_nudge(prompt: str, selection: dict) -> str | None:
+    """v0.4.1 — return a 1-line role-x init suggestion when warranted."""
+    if selection.get("lenses_selected"):
+        return None  # a domain lens already fired — no nudge
+    word_count = len(prompt.split())
+    if not _domain_rich(prompt, word_count):
+        return None
+    # Pick a short candidate slug from the prompt's most distinctive tokens
+    tokens = [
+        tok.lower()
+        for tok in re.findall(r"[A-Za-z][A-Za-z0-9_-]+", prompt)
+        if len(tok) > 3
+    ]
+    # Dedupe in order
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for tok in tokens:
+        if tok not in seen:
+            seen.add(tok)
+            ordered.append(tok)
+    slug = "-".join(ordered[:2]) if ordered else "candidate"
+    return (
+        f"Note: no domain lens scored ≥2 for this prompt. If this kind of "
+        f"work recurs, consider expanding the registry: "
+        f"`role-x init {slug}` (status: candidate)."
+    )
 
 
 def cmd_intake(args: argparse.Namespace) -> int:
@@ -688,6 +747,8 @@ def cmd_intake(args: argparse.Namespace) -> int:
 
     signals = _git_signals(workspace)
     selection = _select_lenses(roles_dir, signals, prompt)
+    # v0.4.1: attach authoring nudge for _meta-only domain-rich prompts
+    selection["authoring_nudge"] = _build_authoring_nudge(prompt, selection)
     _emit_event(session_id, prompt, selection)
     print(_format_intake_context(selection))
     return 0
@@ -879,6 +940,59 @@ def cmd_suggest(args: argparse.Namespace) -> int:
     return 0
 
 
+### coverage subcommand (v0.4.1 — SessionStart-friendly silent-when-healthy report) ###
+
+
+def cmd_coverage(args: argparse.Namespace) -> int:
+    """Brief registry-health summary suitable for a SessionStart hook.
+
+    Silent (exit 0, no output) when registry coverage looks healthy. Prints a
+    3-5 line nudge when fire-rate is below the floor OR when sanitized capture
+    is off so cluster discovery can't run.
+    """
+    events_path = Path(args.events_path) if args.events_path else EVENTS_PATH
+    since_seconds = _parse_duration(args.since)
+    events = _read_events_since(events_path, since_seconds)
+
+    total = len(events)
+    if total < args.min_events and not args.force:
+        return 0  # not enough events to report meaningfully
+
+    fired = sum(1 for ev in events if ev.get("lenses_selected"))
+    unrouted = total - fired
+    pct_fired = (100.0 * fired / total) if total else 0.0
+
+    has_sanitized = any(
+        (ev.get("prompt_sanitized") or {}).get("strategy") == "keywords"
+        for ev in events
+    )
+
+    is_healthy = pct_fired >= COVERAGE_HEALTHY_FIRE_RATE and has_sanitized
+    if is_healthy and not args.force:
+        return 0  # silent — registry coverage looks fine
+
+    # Build a tight nudge (≤5 lines including the action hints)
+    print(
+        f"[role-x coverage] {total} events over {args.since}. "
+        f"Fire-rate: {pct_fired:.0f}% "
+        f"({'low' if pct_fired < COVERAGE_HEALTHY_FIRE_RATE else 'ok'})."
+    )
+    if not has_sanitized:
+        print(
+            "  Sanitized prompt capture is OFF — cluster discovery disabled. "
+            f"Enable: {CONFIG_PATH}"
+        )
+        print(
+            '  Body: {"capture_sanitized_prompt": true, '
+            '"sanitization_strategy": "keywords"}'
+        )
+    elif pct_fired < COVERAGE_HEALTHY_FIRE_RATE:
+        # We have sanitized data but coverage is still low — gesture toward suggest
+        print("  Run `role-x suggest` for emergent cluster + drift report.")
+    print("  Author next: `role-x init <name>` (status: candidate, promote on rule-of-three).")
+    return 0
+
+
 ### init subcommand (v0.4.0 — scaffold a new lens from CLI args) ###
 
 
@@ -1053,6 +1167,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="session id (default: $CLAUDE_SESSION_ID env or 'unknown')",
     )
     p_intake.set_defaults(func=cmd_intake)
+
+    p_coverage = sub.add_parser(
+        "coverage",
+        help="(v0.4.1) brief registry-health summary; silent when coverage is healthy",
+    )
+    p_coverage.add_argument(
+        "--since", default="7d", help="window (default 7d)",
+    )
+    p_coverage.add_argument(
+        "--events-path", default=None, help=f"path to events.jsonl (default: {EVENTS_PATH})",
+    )
+    p_coverage.add_argument(
+        "--min-events", type=int, default=10,
+        help="minimum events in window before reporting (default 10)",
+    )
+    p_coverage.add_argument(
+        "--force", action="store_true", help="always print, even when healthy",
+    )
+    p_coverage.set_defaults(func=cmd_coverage)
 
     p_suggest = sub.add_parser(
         "suggest",
